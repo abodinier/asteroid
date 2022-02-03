@@ -1,9 +1,12 @@
 from pathlib import Path
+from matplotlib.pyplot import stem
 import torch.utils.data
 import random
 import torch
 import tqdm
 import soundfile as sf
+import stempeg
+import librosa
 
 
 class MUSDB18Dataset(torch.utils.data.Dataset):
@@ -18,6 +21,13 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
 
     - MUSDB18 HQ: https://zenodo.org/record/3338373
     - MUSDB18     https://zenodo.org/record/1117372
+    
+    - MUSDB18' stems structure:
+        0. mixture
+        1. drums
+        2. bass
+        3. other
+        4. vocals
 
     .. note::
         The datasets are hosted on Zenodo and require that users
@@ -94,7 +104,6 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
     def __init__(
         self,
         root,
-        sources=["vocals", "bass", "drums", "other"],
         targets=None,
         suffix=".wav",
         split="train",
@@ -105,16 +114,18 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         random_track_mix=False,
         source_augmentations=lambda audio: audio,
         sample_rate=44100,
+        mono=True,
+        stem_structure_dict=None
     ):
 
         self.root = Path(root).expanduser()
         self.split = split
         self.sample_rate = sample_rate
+        self.mono = mono
         self.segment = segment
         self.random_track_mix = random_track_mix
         self.random_segments = random_segments
         self.source_augmentations = source_augmentations
-        self.sources = sources
         self.targets = targets
         self.suffix = suffix
         self.subset = subset
@@ -122,6 +133,16 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         self.tracks = list(self.get_tracks())
         if not self.tracks:
             raise RuntimeError("No tracks found.")
+        if stem_structure_dict is not None:
+            self.stem_structure_dict = stem_structure_dict
+        else:
+            self.stem_structure_dict = {
+                0: "mixture",
+                1: "drums",
+                2: "bass",
+                3: "other",
+                4: "vocals"
+            }
 
     def __getitem__(self, index):
         # assemble the mixture of target and interferers
@@ -135,7 +156,7 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
             start = 0
 
         # load sources
-        for source in self.sources:
+        for idx, source in self.stem_structure_dict.items():
             # optionally select a random track for each source
             if self.random_track_mix:
                 # load a different track
@@ -154,12 +175,22 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
                 stop_sample = None
 
             # load actual audio
-            audio, _ = sf.read(
-                Path(self.tracks[track_id]["path"] / source).with_suffix(self.suffix),
-                always_2d=True,
-                start=start_sample,
-                stop=stop_sample,
+            #audio, _ = sf.read(
+            #    Path(self.tracks[track_id]["path"] / source).with_suffix(self.suffix),
+            #    always_2d=True,
+            #    start=start_sample,
+            #    stop=stop_sample,
+            #)
+            filepath = Path(self.tracks[track_id]["path"]).with_suffix(self.suffix).__str__()
+            audio, _ = stempeg.read_stems(
+                filename=filepath,
+                start=start,
+                duration=self.segment,
+                stem_id=idx
             )
+            if self.mono:
+                audio = librosa.to_mono(audio.T)
+            
             # convert to torch tensor
             audio = torch.tensor(audio.T, dtype=torch.float)
             # apply source-wise augmentations
@@ -167,7 +198,8 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
             audio_sources[source] = audio
 
         # apply linear mix over source index=0
-        audio_mix = torch.stack(list(audio_sources.values())).sum(0)
+        #audio_mix = torch.stack(list(audio_sources.values())).sum(0)
+        audio_mix = audio_sources["mixture"]
         if self.targets:
             audio_sources = torch.stack(
                 [wav for src, wav in audio_sources.items() if src in self.targets], dim=0
@@ -181,27 +213,44 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         """Loads input and output tracks"""
         p = Path(self.root, self.split)
         for track_path in tqdm.tqdm(p.iterdir()):
-            if track_path.is_dir():
+            if track_path.is_file():
                 if self.subset and track_path.stem not in self.subset:
                     # skip this track
                     continue
+                
+                track_infos = stempeg.Info(track_path)
 
-                source_paths = [track_path / (s + self.suffix) for s in self.sources]
-                if not all(sp.exists() for sp in source_paths):
-                    print("Exclude track due to non-existing source", track_path)
+                #source_paths = [track_path / (s + self.suffix) for s in self.sources]
+                #if not all(sp.exists() for sp in source_paths):
+                #    print("Exclude track due to non-existing source", track_path)
+                #    continue
+                nb_sources = track_infos.nb_audio_streams
+                if nb_sources != 5:
+                    print(f"Exclude track due to wrong number of sources ({nb_sources})", track_path)
                     continue
 
                 # get metadata
-                infos = list(map(sf.info, source_paths))
-                if not all(i.samplerate == self.sample_rate for i in infos):
+                #infos = list(map(sf.info, source_paths))
+                #if not all(i.samplerate == self.sample_rate for i in infos):
+                #    print("Exclude track due to different sample rate ", track_path)
+                #    continue
+                sample_rates = [track_infos.sample_rate(i) for i in range(nb_sources)]
+                if not all(i == self.sample_rate for i in sample_rates):
                     print("Exclude track due to different sample rate ", track_path)
                     continue
 
+                #if self.segment is not None:
+                #    # get minimum duration of track
+                #    min_duration = min(i.duration for i in infos)
+                #    if min_duration > self.segment:
+                #        yield ({"path": track_path, "min_duration": min_duration})
+                durations = [track_infos.duration(i) for i in range(nb_sources)]
                 if self.segment is not None:
                     # get minimum duration of track
-                    min_duration = min(i.duration for i in infos)
+                    min_duration = min(durations)
                     if min_duration > self.segment:
                         yield ({"path": track_path, "min_duration": min_duration})
+                
                 else:
                     yield ({"path": track_path, "min_duration": None})
 
