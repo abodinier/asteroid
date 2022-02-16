@@ -115,7 +115,8 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         source_augmentations=lambda audio: audio,
         sample_rate=44100,
         mono=True,
-        stem_structure_dict=None
+        stem_structure_dict=None,
+        size=None
     ):
 
         self.root = Path(root).expanduser()
@@ -133,6 +134,8 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         self.tracks = list(self.get_tracks())
         if not self.tracks:
             raise RuntimeError("No tracks found.")
+        if size is not None:
+            self.tracks = self.tracks[:size]
         if stem_structure_dict is not None:
             self.stem_structure_dict = stem_structure_dict
         else:
